@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import html2canvas from "html2canvas";
 import jsPDF from "jspdf";
 import {
@@ -27,15 +27,13 @@ function npv(rate, cashflows) {
 }
 
 function irr(cashflows) {
-  // Robust-ish IRR using bisection
-  // Works when there is at least one negative and one positive cashflow
   const hasNeg = cashflows.some((x) => x < 0);
   const hasPos = cashflows.some((x) => x > 0);
   if (!hasNeg || !hasPos) return null;
 
   let low = -0.99;
   let high = 5.0;
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 140; i++) {
     const mid = (low + high) / 2;
     const v = npv(mid, cashflows);
     if (Math.abs(v) < 1e-4) return mid;
@@ -60,31 +58,30 @@ function yearlyGenerationKwh({ kW, psh, pr, deg, year }) {
   return base * factor;
 }
 
+/**
+ * Volatilidad PRO: estable y reproducible
+ * (evita que los resultados cambien “solos” en cada render).
+ */
+function stableNoise01(seedStr) {
+  let h = 2166136261;
+  for (let i = 0; i < seedStr.length; i++) {
+    h ^= seedStr.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  // [0,1)
+  return ((h >>> 0) % 100000) / 100000;
+}
+
 /* ---------------- Incentivos (simulación) ---------------- */
 /**
- * Nota: simulación simplificada (no sustituye asesoría tributaria).
- * - IVA: reducción de CAPEX por exclusión de IVA (19%)
- * - Arancel: reducción adicional (por defecto 5%)
- * - Deducción renta Ley 1715: 50% de la inversión (net) repartido en X años (default 15),
- *   multiplicado por tarifa de renta (default 35%) -> beneficio anual simulado.
+ * Simulación simplificada (no sustituye asesoría).
+ * Referencias: Ley 1715 y guías de incentivos (UPME/MinAmbiente). :contentReference[oaicite:1]{index=1}
  */
 const INCENTIVOS = [
-  {
-    key: "none",
-    name: "Ninguno"
-  },
-  {
-    key: "co_iva",
-    name: "Colombia – Solo exclusión de IVA (simulación)"
-  },
-  {
-    key: "co_iva_arancel",
-    name: "Colombia – IVA + Arancel (simulación)"
-  },
-  {
-    key: "co_full",
-    name: "Colombia – Paquete completo (IVA + Arancel + Deducción renta)"
-  }
+  { key: "none", name: "Ninguno" },
+  { key: "co_iva", name: "Colombia – Solo exclusión de IVA (simulación)" },
+  { key: "co_iva_arancel", name: "Colombia – IVA + Arancel (simulación)" },
+  { key: "co_full", name: "Colombia – Paquete completo (IVA + Arancel + Deducción renta)" }
 ];
 
 function applyIncentives(capexBruto, opt) {
@@ -93,12 +90,12 @@ function applyIncentives(capexBruto, opt) {
 
   let capexNeto = capexBruto;
 
-  // IVA
+  // IVA (si capexBruto incluye IVA)
   if (opt.scheme === "co_iva" || opt.scheme === "co_iva_arancel" || opt.scheme === "co_full") {
-    capexNeto = capexNeto / (1 + ivaRate); // si capexBruto incluye IVA
+    capexNeto = capexNeto / (1 + ivaRate);
   }
 
-  // Arancel (simulación como porcentaje de equipos dentro del CAPEX)
+  // Arancel (simulación como reducción adicional)
   if (opt.scheme === "co_iva_arancel" || opt.scheme === "co_full") {
     capexNeto = capexNeto * (1 - arancelRate);
   }
@@ -106,7 +103,7 @@ function applyIncentives(capexBruto, opt) {
   // Deducción renta (flujo anual adicional simulado)
   let taxBenefitAnnual = 0;
   if (opt.scheme === "co_full") {
-    const deductionBase = 0.5 * capexNeto;
+    const deductionBase = 0.5 * capexNeto; // referencia común de hasta 50% (simulación)
     const deductionYears = Math.max(1, Math.round(opt.deductionYears));
     const taxRate = clamp(opt.taxRate, 0, 0.5);
     taxBenefitAnnual = (deductionBase / deductionYears) * taxRate;
@@ -116,7 +113,11 @@ function applyIncentives(capexBruto, opt) {
 }
 
 /* ---------------- Scenario Model ---------------- */
-function computeScenario(s, global) {
+/**
+ * Excedentes: en Colombia AGPE/GD se rige por CREG y procedimientos de OR.
+ * La remuneración/compensación de excedentes puede incluir cobros y reglas específicas por OR. :contentReference[oaicite:2]{index=2}
+ */
+function computeScenario(s, global, seedTag = "base") {
   const years = Math.max(5, Math.round(s.lifeYears));
   const discount = clamp(s.discountRate, 0.01, 0.6);
 
@@ -134,7 +135,9 @@ function computeScenario(s, global) {
   const tariff0 = Math.max(0, s.tariff);
   const esc = clamp(s.tariffEscalation, 0, 0.35);
   const vol = clamp(s.tariffVolatility, 0, 0.5);
-  const exportFactor = clamp(s.exportFactor, 0, 1);
+
+  // ✅ PRO: con/sin excedentes
+  const exportFactor = global.includeExports ? clamp(s.exportFactor, 0, 1) : 0;
 
   const selfFrac = clamp(s.selfConsumption, 0, 1);
 
@@ -143,10 +146,16 @@ function computeScenario(s, global) {
   const annuals = [];
 
   for (let y = 1; y <= years; y++) {
-    // Tarifa del año y (variable)
+    // Tarifa año y (escalamiento + volatilidad estable)
     const baseTariff = tariff0 * Math.pow(1 + esc, y - 1);
-    const jitter = global.useVolatility ? (1 + (Math.random() * 2 - 1) * vol) : 1;
-    const tariffY = Math.max(0, baseTariff * jitter);
+
+    let tariffY = baseTariff;
+    if (global.useVolatility) {
+      // jitter en rango [-vol, +vol], pero estable
+      const u = stableNoise01(`${seedTag}|${y}|${tariff0}|${esc}|${vol}`);
+      const jitter = 1 + (u * 2 - 1) * vol;
+      tariffY = Math.max(0, baseTariff * jitter);
+    }
 
     const gen = yearlyGenerationKwh({
       kW: s.kW,
@@ -159,11 +168,15 @@ function computeScenario(s, global) {
     const selfKwh = gen * selfFrac;
     const expKwh = gen * (1 - selfFrac);
 
+    // Precio excedentes como factor vs tarifa (lo que ya venías usando)
     const exportPrice = tariffY * exportFactor;
 
-    const savings = selfKwh * tariffY + expKwh * exportPrice;
+    const savingsSelf = selfKwh * tariffY;
+    const revenueExp = expKwh * exportPrice;
 
-    // O&M crece con la tarifa (aprox)
+    const savings = savingsSelf + revenueExp;
+
+    // O&M crece con escalamiento (aprox)
     if (y > 1) om = om * (1 + esc);
 
     const benefitTax = global.includeTaxBenefit ? taxBenefitAnnual : 0;
@@ -176,6 +189,10 @@ function computeScenario(s, global) {
       year: y,
       tariff: tariffY,
       generationKwh: gen,
+      selfKwh,
+      expKwh,
+      savingsSelf,
+      revenueExp,
       savings,
       om,
       taxBenefit: benefitTax,
@@ -189,6 +206,11 @@ function computeScenario(s, global) {
   const pb = paybackYear(cashflows);
   const roi1 = cashflows[1] / capexNeto;
 
+  // % ingresos por excedentes (año 1) — señal PRO de sobredimensionamiento
+  const y1 = annuals[0];
+  const exportShareY1 =
+    y1 && y1.savings > 0 ? clamp(y1.revenueExp / y1.savings, 0, 1) : 0;
+
   return {
     years,
     capexNeto,
@@ -197,7 +219,8 @@ function computeScenario(s, global) {
     NPV,
     IRR,
     payback: pb,
-    roi1
+    roi1,
+    exportShareY1
   };
 }
 
@@ -249,9 +272,12 @@ function EnergyIcon() {
 export default function App() {
   const [active, setActive] = useState("B");
   const [engineer, setEngineer] = useState(true);
+
+  // ✅ PRO: includeExports
   const [global, setGlobal] = useState({
     includeTaxBenefit: true,
-    useVolatility: false
+    useVolatility: false,
+    includeExports: true
   });
 
   const [sc, setSc] = useState({
@@ -263,32 +289,44 @@ export default function App() {
   // Recalc models
   const models = useMemo(() => {
     return {
-      A: computeScenario(sc.A, global),
-      B: computeScenario(sc.B, global),
-      C: computeScenario(sc.C, global)
+      A: computeScenario(sc.A, global, "A"),
+      B: computeScenario(sc.B, global, "B"),
+      C: computeScenario(sc.C, global, "C")
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sc, global.includeTaxBenefit, global.useVolatility]);
+  }, [sc, global.includeTaxBenefit, global.useVolatility, global.includeExports]);
 
   const activeScenario = sc[active];
   const activeModel = models[active];
+
+  // ✅ PRO: comparativo Con vs Sin excedentes SOLO del escenario activo
+  const modelWithExports = useMemo(() => {
+    return computeScenario(activeScenario, { ...global, includeExports: true }, `${active}|with`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScenario, global.includeTaxBenefit, global.useVolatility]);
+
+  const modelNoExports = useMemo(() => {
+    return computeScenario(activeScenario, { ...global, includeExports: false }, `${active}|no`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScenario, global.includeTaxBenefit, global.useVolatility]);
 
   const chartData = useMemo(() => {
     const years = activeModel.years;
     const data = [];
     for (let y = 0; y <= years; y++) {
       const aCum =
-        y === 0 ? models.A.cashflows[0] : models.A.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
+        y === 0
+          ? models.A.cashflows[0]
+          : models.A.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
       const bCum =
-        y === 0 ? models.B.cashflows[0] : models.B.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
+        y === 0
+          ? models.B.cashflows[0]
+          : models.B.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
       const cCum =
-        y === 0 ? models.C.cashflows[0] : models.C.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
-      data.push({
-        year: y,
-        A: aCum,
-        B: bCum,
-        C: cCum
-      });
+        y === 0
+          ? models.C.cashflows[0]
+          : models.C.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
+      data.push({ year: y, A: aCum, B: bCum, C: cCum });
     }
     return data;
   }, [models, activeModel.years]);
@@ -321,11 +359,9 @@ export default function App() {
   const reportRef = useRef(null);
 
   async function exportPDF() {
-    // Captura nítida + sin “opaco”: usamos contenedor blanco dedicado (reportRef)
     const el = reportRef.current;
     if (!el) return;
 
-    // Espera un tick para que el DOM esté listo
     await new Promise((r) => setTimeout(r, 50));
 
     const canvas = await html2canvas(el, {
@@ -341,15 +377,12 @@ export default function App() {
     const pageW = pdf.internal.pageSize.getWidth();
     const pageH = pdf.internal.pageSize.getHeight();
 
-    // Ajustar imagen a página sin cortar
     const imgW = pageW;
     const imgH = (canvas.height * imgW) / canvas.width;
 
-    let y = 0;
     if (imgH <= pageH) {
       pdf.addImage(imgData, "PNG", 0, 0, imgW, imgH);
     } else {
-      // Si queda largo, paginar
       let remaining = imgH;
       let position = 0;
       while (remaining > 0) {
@@ -360,16 +393,31 @@ export default function App() {
       }
     }
 
-    pdf.save(`Smart_Energy_ROI_${activeScenario.name}_v2.pdf`);
+    pdf.save(`Smart_Energy_ROI_${activeScenario.name}_v2_PRO.pdf`);
   }
 
   const conclusions = useMemo(() => {
-    const { NPV, IRR, payback } = activeModel;
+    const { NPV, IRR, payback, exportShareY1 } = activeModel;
     const scheme = activeScenario.incentiveScheme;
     const schemeName = INCENTIVOS.find((x) => x.key === scheme)?.name || "Ninguno";
 
     const lines = [];
 
+    // Excedentes
+    lines.push(
+      global.includeExports
+        ? "Excedentes: incluidos (venta/compensación al OR según reglas aplicables)."
+        : "Excedentes: no incluidos (escenario conservador, solo autoconsumo)."
+    );
+
+    if (global.includeExports) {
+      lines.push(`Señal PRO: en año 1, ~${fmtPct(exportShareY1)} de los ingresos provienen de excedentes.`);
+      if (exportShareY1 >= 0.35) {
+        lines.push("⚠️ Alto peso de excedentes: revisa sobredimensionamiento o negocia CAPEX (riesgo regulatorio/operativo).");
+      }
+    }
+
+    // Incentivos
     if (scheme !== "none") {
       if (scheme === "co_full") {
         lines.push("Incentivos Colombia: IVA + arancel + deducción en renta (simulación).");
@@ -378,11 +426,12 @@ export default function App() {
       } else if (scheme === "co_iva") {
         lines.push("Incentivos Colombia: exclusión de IVA (simulación).");
       }
-      lines.push("Nota: elegibilidad real depende de requisitos UPME/RETIE y soportes del contribuyente.");
+      lines.push("Nota: elegibilidad real depende de requisitos y soportes del contribuyente (UPME/RETIE, entre otros).");
     } else {
       lines.push("Sin incentivos tributarios considerados.");
     }
 
+    // KPI
     if (NPV > 0) lines.push("Rentabilidad: VPN positivo (proyecto viable).");
     else lines.push("Rentabilidad: VPN negativo (revisar CAPEX/tarifa/autoconsumo).");
 
@@ -393,12 +442,17 @@ export default function App() {
     if (payback != null) lines.push(`Payback estimado: año ${payback}.`);
     else lines.push("Payback: no recupera inversión dentro del horizonte.");
 
-    if (global.useVolatility) lines.push("Tarifa: variable con volatilidad activada (sensibilidad).");
+    if (global.useVolatility) lines.push("Tarifa: variable con volatilidad activada (sensibilidad estable).");
     else lines.push("Tarifa: escalamiento fijo anual.");
+
+    // Comparativo con/sin excedentes
+    const deltaNPV = modelWithExports.NPV - modelNoExports.NPV;
+    lines.push(`Impacto de excedentes en VPN (Con − Sin): $ ${fmtCOP(deltaNPV)}.`);
 
     lines.push(`Esquema de incentivos seleccionado: ${schemeName}.`);
     return lines;
-  }, [activeModel, activeScenario, global.useVolatility]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeModel, activeScenario, global.useVolatility, global.includeExports, modelWithExports.NPV, modelNoExports.NPV]);
 
   return (
     <div className="container">
@@ -411,10 +465,11 @@ export default function App() {
             </div>
             <div>
               <div className="title">
-                <span className="g">Smart</span> <span className="b">Energy</span> ROI <span style={{fontSize:12, opacity:.9}}>v2.0</span>
+                <span className="g">Smart</span> <span className="b">Energy</span> ROI{" "}
+                <span style={{ fontSize: 12, opacity: 0.9 }}>v2.0 PRO</span>
               </div>
               <div className="subtitle">
-                Escenarios A/B/C • Incentivos Colombia • Precio energía variable • Reporte PDF
+                Escenarios A/B/C • Incentivos Colombia • Precio energía variable • Con/Sin excedentes • PDF PRO
               </div>
             </div>
           </div>
@@ -471,94 +526,52 @@ export default function App() {
             <div className="form">
               <div className="field">
                 <label>Nombre del escenario</label>
-                <input
-                  value={activeScenario.name}
-                  onChange={(e) => update("name", e.target.value)}
-                />
+                <input value={activeScenario.name} onChange={(e) => update("name", e.target.value)} />
               </div>
 
               <div className="field">
                 <label>Vida útil (años)</label>
-                <input
-                  type="number"
-                  value={activeScenario.lifeYears}
-                  onChange={(e) => update("lifeYears", Number(e.target.value))}
-                />
+                <input type="number" value={activeScenario.lifeYears} onChange={(e) => update("lifeYears", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>Tarifa base (COP/kWh)</label>
-                <input
-                  type="number"
-                  value={activeScenario.tariff}
-                  onChange={(e) => update("tariff", Number(e.target.value))}
-                />
+                <input type="number" value={activeScenario.tariff} onChange={(e) => update("tariff", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>Potencia FV (kW)</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={activeScenario.kW}
-                  onChange={(e) => update("kW", Number(e.target.value))}
-                />
+                <input type="number" step="0.1" value={activeScenario.kW} onChange={(e) => update("kW", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>% autoconsumo (0–1)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={activeScenario.selfConsumption}
-                  onChange={(e) => update("selfConsumption", Number(e.target.value))}
-                />
+                <input type="number" step="0.01" value={activeScenario.selfConsumption} onChange={(e) => update("selfConsumption", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>CAPEX (COP)</label>
-                <input
-                  type="number"
-                  value={activeScenario.capex}
-                  onChange={(e) => update("capex", Number(e.target.value))}
-                />
+                <input type="number" value={activeScenario.capex} onChange={(e) => update("capex", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>O&amp;M anual (COP)</label>
-                <input
-                  type="number"
-                  value={activeScenario.omAnnual}
-                  onChange={(e) => update("omAnnual", Number(e.target.value))}
-                />
+                <input type="number" value={activeScenario.omAnnual} onChange={(e) => update("omAnnual", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>Tasa descuento</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={activeScenario.discountRate}
-                  onChange={(e) => update("discountRate", Number(e.target.value))}
-                />
+                <input type="number" step="0.01" value={activeScenario.discountRate} onChange={(e) => update("discountRate", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>Escalamiento tarifa (anual)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={activeScenario.tariffEscalation}
-                  onChange={(e) => update("tariffEscalation", Number(e.target.value))}
-                />
+                <input type="number" step="0.01" value={activeScenario.tariffEscalation} onChange={(e) => update("tariffEscalation", Number(e.target.value))} />
               </div>
 
               <div className="field">
                 <label>Incentivos tributarios (Colombia)</label>
-                <select
-                  value={activeScenario.incentiveScheme}
-                  onChange={(e) => update("incentiveScheme", e.target.value)}
-                >
+                <select value={activeScenario.incentiveScheme} onChange={(e) => update("incentiveScheme", e.target.value)}>
                   {INCENTIVOS.map((x) => (
                     <option key={x.key} value={x.key}>
                       {x.name}
@@ -582,7 +595,14 @@ export default function App() {
                 className={`pill ${global.useVolatility ? "active" : ""}`}
                 onClick={() => setGlobal((p) => ({ ...p, useVolatility: !p.useVolatility }))}
               >
-                {global.useVolatility ? "✓" : " "} Tarifa con volatilidad
+                {global.useVolatility ? "✓" : " "} Tarifa con volatilidad (estable)
+              </button>
+
+              <button
+                className={`pill ${global.includeExports ? "active" : ""}`}
+                onClick={() => setGlobal((p) => ({ ...p, includeExports: !p.includeExports }))}
+              >
+                {global.includeExports ? "✓" : " "} Considerar excedentes (venta/compensación OR)
               </button>
             </div>
 
@@ -593,89 +613,47 @@ export default function App() {
                 <div className="form">
                   <div className="field">
                     <label>PSH (h/día)</label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={activeScenario.psh}
-                      onChange={(e) => update("psh", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.1" value={activeScenario.psh} onChange={(e) => update("psh", Number(e.target.value))} />
                   </div>
+
                   <div className="field">
                     <label>PR (0–1)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeScenario.pr}
-                      onChange={(e) => update("pr", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.01" value={activeScenario.pr} onChange={(e) => update("pr", Number(e.target.value))} />
                   </div>
+
                   <div className="field">
                     <label>Degradación anual</label>
-                    <input
-                      type="number"
-                      step="0.001"
-                      value={activeScenario.degAnnual}
-                      onChange={(e) => update("degAnnual", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.001" value={activeScenario.degAnnual} onChange={(e) => update("degAnnual", Number(e.target.value))} />
                   </div>
 
                   <div className="field">
                     <label>Precio excedentes (factor vs tarifa)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeScenario.exportFactor}
-                      onChange={(e) => update("exportFactor", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.01" value={activeScenario.exportFactor} onChange={(e) => update("exportFactor", Number(e.target.value))} />
                   </div>
 
                   <div className="field">
                     <label>IVA (simulación)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeScenario.ivaRate}
-                      onChange={(e) => update("ivaRate", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.01" value={activeScenario.ivaRate} onChange={(e) => update("ivaRate", Number(e.target.value))} />
                   </div>
 
                   <div className="field">
                     <label>Arancel (simulación)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeScenario.arancelRate}
-                      onChange={(e) => update("arancelRate", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.01" value={activeScenario.arancelRate} onChange={(e) => update("arancelRate", Number(e.target.value))} />
                   </div>
 
                   <div className="field">
                     <label>Tarifa de renta (simulación)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeScenario.taxRate}
-                      onChange={(e) => update("taxRate", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.01" value={activeScenario.taxRate} onChange={(e) => update("taxRate", Number(e.target.value))} />
                   </div>
 
                   <div className="field">
                     <label>Años deducción (simulación)</label>
-                    <input
-                      type="number"
-                      value={activeScenario.deductionYears}
-                      onChange={(e) => update("deductionYears", Number(e.target.value))}
-                    />
+                    <input type="number" value={activeScenario.deductionYears} onChange={(e) => update("deductionYears", Number(e.target.value))} />
                   </div>
 
                   <div className="field">
                     <label>Volatilidad tarifa (±)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={activeScenario.tariffVolatility}
-                      onChange={(e) => update("tariffVolatility", Number(e.target.value))}
-                    />
+                    <input type="number" step="0.01" value={activeScenario.tariffVolatility} onChange={(e) => update("tariffVolatility", Number(e.target.value))} />
                   </div>
                 </div>
               </>
@@ -705,10 +683,7 @@ export default function App() {
                       return `${v.toFixed(0)}`;
                     }}
                   />
-                  <Tooltip
-                    formatter={(val) => [`$ ${fmtCOP(val)}`, "Acumulado"]}
-                    labelFormatter={(l) => `Año ${l}`}
-                  />
+                  <Tooltip formatter={(val) => [`$ ${fmtCOP(val)}`, "Acumulado"]} labelFormatter={(l) => `Año ${l}`} />
                   <Legend />
                   <Line type="monotone" dataKey="A" stroke="#22c55e" strokeWidth={2.6} dot={false} name="Acumulado A" />
                   <Line type="monotone" dataKey="B" stroke="#3b82f6" strokeWidth={2.6} dot={false} name="Acumulado B" />
@@ -718,7 +693,55 @@ export default function App() {
             </div>
 
             <div className="note">
-              Nota: la deducción en renta se modela como flujo anual adicional (simulación). Exportación usa factor vs tarifa.
+              Nota PRO: volatilidad es estable (no cambia sola). Excedentes en Colombia tienen reglas/compensaciones según OR y regulación aplicable. :contentReference[oaicite:3]{index=3}
+            </div>
+          </div>
+
+          {/* ✅ PRO: Con vs Sin excedentes */}
+          <div className="card">
+            <h3>Viabilidad: Con vs Sin excedentes</h3>
+            <div className="small">
+              Comparación del escenario <b>{active}</b> ({activeScenario.name}) con excedentes (ON) y sin excedentes (OFF).
+            </div>
+
+            <div className="hr" />
+
+            <div className="kpis">
+              <div className="kpi">
+                <div className="label">VPN (Con excedentes)</div>
+                <div className="value green">$ {fmtCOP(modelWithExports.NPV)}</div>
+              </div>
+
+              <div className="kpi">
+                <div className="label">VPN (Sin excedentes)</div>
+                <div className="value green">$ {fmtCOP(modelNoExports.NPV)}</div>
+              </div>
+
+              <div className="kpi">
+                <div className="label">TIR (Con excedentes)</div>
+                <div className="value blue">{modelWithExports.IRR == null ? "—" : fmtPct(modelWithExports.IRR)}</div>
+              </div>
+
+              <div className="kpi">
+                <div className="label">TIR (Sin excedentes)</div>
+                <div className="value blue">{modelNoExports.IRR == null ? "—" : fmtPct(modelNoExports.IRR)}</div>
+              </div>
+
+              <div className="kpi">
+                <div className="label">Payback (Con excedentes)</div>
+                <div className="value">{modelWithExports.payback == null ? "—" : `${modelWithExports.payback} años`}</div>
+              </div>
+
+              <div className="kpi">
+                <div className="label">Payback (Sin excedentes)</div>
+                <div className="value">{modelNoExports.payback == null ? "—" : `${modelNoExports.payback} años`}</div>
+              </div>
+            </div>
+
+            <div className="note">
+              Impacto de excedentes en VPN (Con − Sin): <b>$ {fmtCOP(modelWithExports.NPV - modelNoExports.NPV)}</b>.
+              <br />
+              Señal PRO (año 1): excedentes aportan ~<b>{fmtPct(modelWithExports.exportShareY1)}</b> de ingresos.
             </div>
           </div>
 
@@ -729,28 +752,22 @@ export default function App() {
             <div className="kpis">
               <div className="kpi">
                 <div className="label">VPN (NPV)</div>
-                <div className={`value green`}>$ {fmtCOP(activeModel.NPV)}</div>
+                <div className="value green">$ {fmtCOP(activeModel.NPV)}</div>
               </div>
 
               <div className="kpi">
                 <div className="label">TIR (IRR)</div>
-                <div className="value blue">
-                  {activeModel.IRR == null ? "—" : fmtPct(activeModel.IRR)}
-                </div>
+                <div className="value blue">{activeModel.IRR == null ? "—" : fmtPct(activeModel.IRR)}</div>
               </div>
 
               <div className="kpi">
                 <div className="label">Payback</div>
-                <div className="value">
-                  {activeModel.payback == null ? "—" : `${activeModel.payback} años`}
-                </div>
+                <div className="value">{activeModel.payback == null ? "—" : `${activeModel.payback} años`}</div>
               </div>
 
               <div className="kpi">
                 <div className="label">ROI año 1</div>
-                <div className="value">
-                  {fmtPct(activeModel.roi1)}
-                </div>
+                <div className="value">{fmtPct(activeModel.roi1)}</div>
               </div>
             </div>
 
@@ -768,12 +785,12 @@ export default function App() {
         </div>
       </div>
 
-      {/* Hidden report for PDF (white background, no opaco, no pérdida de datos) */}
+      {/* Hidden report for PDF */}
       <div className="reportWrap">
         <div className="report" ref={reportRef}>
-          <h1>Smart Energy ROI v2.0 • Reporte</h1>
+          <h1>Smart Energy ROI v2.0 PRO • Reporte</h1>
           <div className="muted">
-            Escenario {active} • {activeScenario.name} • Valores en COP • Simulación educativa
+            Escenario {active} • {activeScenario.name} • COP • Simulación educativa
           </div>
 
           <div className="row">
@@ -797,6 +814,16 @@ export default function App() {
 
           <div className="row">
             <div className="box">
+              <div className="t">Con vs Sin excedentes (escenario {active})</div>
+              <div className="muted" style={{ marginTop: 8 }}>
+                VPN con excedentes: <b>$ {fmtCOP(modelWithExports.NPV)}</b><br/>
+                VPN sin excedentes: <b>$ {fmtCOP(modelNoExports.NPV)}</b><br/>
+                Diferencia (Con − Sin): <b>$ {fmtCOP(modelWithExports.NPV - modelNoExports.NPV)}</b><br/>
+                % ingresos por excedentes (año 1): <b>{fmtPct(modelWithExports.exportShareY1)}</b>
+              </div>
+            </div>
+
+            <div className="box">
               <div className="t">Entradas principales</div>
               <div className="muted" style={{ marginTop: 8 }}>
                 Potencia: <b>{activeScenario.kW} kW</b><br/>
@@ -806,6 +833,9 @@ export default function App() {
                 CAPEX (neto): <b>$ {fmtCOP(activeModel.capexNeto)}</b>
               </div>
             </div>
+          </div>
+
+          <div className="row">
             <div className="box">
               <div className="t">Conclusiones</div>
               <ul>
@@ -814,10 +844,18 @@ export default function App() {
                 ))}
               </ul>
             </div>
+            <div className="box">
+              <div className="t">Nota</div>
+              <div className="muted" style={{ marginTop: 8 }}>
+                Este reporte usa “layout blanco” para asegurar legibilidad en PDF.
+                <br />
+                Excedentes y conexión AGPE/GD están sujetos a regulación y reglas del OR. :contentReference[oaicite:4]{index=4}
+              </div>
+            </div>
           </div>
 
           <div className="muted" style={{ marginTop: 10 }}>
-            Nota: este reporte usa un “layout blanco” para asegurar legibilidad en PDF (sin opacidad y sin pérdida de texto).
+            Incentivos tributarios (simulación) basados en marcos divulgativos de Ley 1715/UPME. :contentReference[oaicite:5]{index=5}
           </div>
         </div>
       </div>
