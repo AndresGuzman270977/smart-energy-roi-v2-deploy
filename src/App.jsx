@@ -59,8 +59,7 @@ function yearlyGenerationKwh({ kW, psh, pr, deg, year }) {
 }
 
 /**
- * Volatilidad PRO: estable y reproducible
- * (evita que los resultados cambien “solos” en cada render).
+ * Volatilidad estable (no cambia con re-renders)
  */
 function stableNoise01(seedStr) {
   let h = 2166136261;
@@ -68,15 +67,10 @@ function stableNoise01(seedStr) {
     h ^= seedStr.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
-  // [0,1)
-  return ((h >>> 0) % 100000) / 100000;
+  return ((h >>> 0) % 100000) / 100000; // [0,1)
 }
 
 /* ---------------- Incentivos (simulación) ---------------- */
-/**
- * Simulación simplificada (no sustituye asesoría).
- * Referencias: Ley 1715 y guías de incentivos (UPME/MinAmbiente). :contentReference[oaicite:1]{index=1}
- */
 const INCENTIVOS = [
   { key: "none", name: "Ninguno" },
   { key: "co_iva", name: "Colombia – Solo exclusión de IVA (simulación)" },
@@ -95,7 +89,7 @@ function applyIncentives(capexBruto, opt) {
     capexNeto = capexNeto / (1 + ivaRate);
   }
 
-  // Arancel (simulación como reducción adicional)
+  // Arancel (simulación como reducción)
   if (opt.scheme === "co_iva_arancel" || opt.scheme === "co_full") {
     capexNeto = capexNeto * (1 - arancelRate);
   }
@@ -103,7 +97,7 @@ function applyIncentives(capexBruto, opt) {
   // Deducción renta (flujo anual adicional simulado)
   let taxBenefitAnnual = 0;
   if (opt.scheme === "co_full") {
-    const deductionBase = 0.5 * capexNeto; // referencia común de hasta 50% (simulación)
+    const deductionBase = 0.5 * capexNeto;
     const deductionYears = Math.max(1, Math.round(opt.deductionYears));
     const taxRate = clamp(opt.taxRate, 0, 0.5);
     taxBenefitAnnual = (deductionBase / deductionYears) * taxRate;
@@ -113,10 +107,6 @@ function applyIncentives(capexBruto, opt) {
 }
 
 /* ---------------- Scenario Model ---------------- */
-/**
- * Excedentes: en Colombia AGPE/GD se rige por CREG y procedimientos de OR.
- * La remuneración/compensación de excedentes puede incluir cobros y reglas específicas por OR. :contentReference[oaicite:2]{index=2}
- */
 function computeScenario(s, global, seedTag = "base") {
   const years = Math.max(5, Math.round(s.lifeYears));
   const discount = clamp(s.discountRate, 0.01, 0.6);
@@ -136,22 +126,19 @@ function computeScenario(s, global, seedTag = "base") {
   const esc = clamp(s.tariffEscalation, 0, 0.35);
   const vol = clamp(s.tariffVolatility, 0, 0.5);
 
-  // ✅ PRO: con/sin excedentes
+  // Con/Sin excedentes
   const exportFactor = global.includeExports ? clamp(s.exportFactor, 0, 1) : 0;
 
   const selfFrac = clamp(s.selfConsumption, 0, 1);
-
   let om = Math.max(0, s.omAnnual);
 
   const annuals = [];
 
   for (let y = 1; y <= years; y++) {
-    // Tarifa año y (escalamiento + volatilidad estable)
     const baseTariff = tariff0 * Math.pow(1 + esc, y - 1);
 
     let tariffY = baseTariff;
     if (global.useVolatility) {
-      // jitter en rango [-vol, +vol], pero estable
       const u = stableNoise01(`${seedTag}|${y}|${tariff0}|${esc}|${vol}`);
       const jitter = 1 + (u * 2 - 1) * vol;
       tariffY = Math.max(0, baseTariff * jitter);
@@ -168,19 +155,15 @@ function computeScenario(s, global, seedTag = "base") {
     const selfKwh = gen * selfFrac;
     const expKwh = gen * (1 - selfFrac);
 
-    // Precio excedentes como factor vs tarifa (lo que ya venías usando)
     const exportPrice = tariffY * exportFactor;
 
     const savingsSelf = selfKwh * tariffY;
     const revenueExp = expKwh * exportPrice;
-
     const savings = savingsSelf + revenueExp;
 
-    // O&M crece con escalamiento (aprox)
     if (y > 1) om = om * (1 + esc);
 
     const benefitTax = global.includeTaxBenefit ? taxBenefitAnnual : 0;
-
     const net = savings - om + benefitTax;
 
     cashflows[y] = net;
@@ -206,7 +189,6 @@ function computeScenario(s, global, seedTag = "base") {
   const pb = paybackYear(cashflows);
   const roi1 = cashflows[1] / capexNeto;
 
-  // % ingresos por excedentes (año 1) — señal PRO de sobredimensionamiento
   const y1 = annuals[0];
   const exportShareY1 =
     y1 && y1.savings > 0 ? clamp(y1.revenueExp / y1.savings, 0, 1) : 0;
@@ -273,7 +255,6 @@ export default function App() {
   const [active, setActive] = useState("B");
   const [engineer, setEngineer] = useState(true);
 
-  // ✅ PRO: includeExports
   const [global, setGlobal] = useState({
     includeTaxBenefit: true,
     useVolatility: false,
@@ -286,46 +267,32 @@ export default function App() {
     C: { ...defaultScenario("Optimista", "purple"), tariff: 1200, selfConsumption: 0.75, tariffEscalation: 0.1 }
   });
 
-  // Recalc models
   const models = useMemo(() => {
     return {
       A: computeScenario(sc.A, global, "A"),
       B: computeScenario(sc.B, global, "B"),
       C: computeScenario(sc.C, global, "C")
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sc, global.includeTaxBenefit, global.useVolatility, global.includeExports]);
 
   const activeScenario = sc[active];
   const activeModel = models[active];
 
-  // ✅ PRO: comparativo Con vs Sin excedentes SOLO del escenario activo
   const modelWithExports = useMemo(() => {
     return computeScenario(activeScenario, { ...global, includeExports: true }, `${active}|with`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScenario, global.includeTaxBenefit, global.useVolatility]);
+  }, [activeScenario, global.includeTaxBenefit, global.useVolatility, active]);
 
   const modelNoExports = useMemo(() => {
     return computeScenario(activeScenario, { ...global, includeExports: false }, `${active}|no`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScenario, global.includeTaxBenefit, global.useVolatility]);
+  }, [activeScenario, global.includeTaxBenefit, global.useVolatility, active]);
 
   const chartData = useMemo(() => {
     const years = activeModel.years;
     const data = [];
     for (let y = 0; y <= years; y++) {
-      const aCum =
-        y === 0
-          ? models.A.cashflows[0]
-          : models.A.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
-      const bCum =
-        y === 0
-          ? models.B.cashflows[0]
-          : models.B.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
-      const cCum =
-        y === 0
-          ? models.C.cashflows[0]
-          : models.C.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
+      const aCum = y === 0 ? models.A.cashflows[0] : models.A.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
+      const bCum = y === 0 ? models.B.cashflows[0] : models.B.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
+      const cCum = y === 0 ? models.C.cashflows[0] : models.C.cashflows.slice(0, y + 1).reduce((p, c) => p + c, 0);
       data.push({ year: y, A: aCum, B: bCum, C: cCum });
     }
     return data;
@@ -361,7 +328,6 @@ export default function App() {
   async function exportPDF() {
     const el = reportRef.current;
     if (!el) return;
-
     await new Promise((r) => setTimeout(r, 50));
 
     const canvas = await html2canvas(el, {
@@ -403,73 +369,60 @@ export default function App() {
 
     const lines = [];
 
-    // Excedentes
     lines.push(
       global.includeExports
-        ? "Excedentes: incluidos (venta/compensación al OR según reglas aplicables)."
-        : "Excedentes: no incluidos (escenario conservador, solo autoconsumo)."
+        ? "Excedentes: incluidos (venta/compensación)."
+        : "Excedentes: no incluidos (solo autoconsumo)."
     );
 
     if (global.includeExports) {
-      lines.push(`Señal PRO: en año 1, ~${fmtPct(exportShareY1)} de los ingresos provienen de excedentes.`);
+      lines.push(`Señal PRO: año 1 ~${fmtPct(exportShareY1)} de ingresos proviene de excedentes.`);
       if (exportShareY1 >= 0.35) {
-        lines.push("⚠️ Alto peso de excedentes: revisa sobredimensionamiento o negocia CAPEX (riesgo regulatorio/operativo).");
+        lines.push("⚠️ Alto peso de excedentes: revisar sobredimensionamiento / negociar CAPEX.");
       }
     }
 
-    // Incentivos
     if (scheme !== "none") {
-      if (scheme === "co_full") {
-        lines.push("Incentivos Colombia: IVA + arancel + deducción en renta (simulación).");
-      } else if (scheme === "co_iva_arancel") {
-        lines.push("Incentivos Colombia: IVA + arancel (simulación).");
-      } else if (scheme === "co_iva") {
-        lines.push("Incentivos Colombia: exclusión de IVA (simulación).");
-      }
-      lines.push("Nota: elegibilidad real depende de requisitos y soportes del contribuyente (UPME/RETIE, entre otros).");
+      if (scheme === "co_full") lines.push("Incentivos CO: IVA + arancel + deducción renta (simulación).");
+      else if (scheme === "co_iva_arancel") lines.push("Incentivos CO: IVA + arancel (simulación).");
+      else if (scheme === "co_iva") lines.push("Incentivos CO: exclusión IVA (simulación).");
+      lines.push("Nota: elegibilidad real depende de requisitos y soportes del contribuyente.");
     } else {
       lines.push("Sin incentivos tributarios considerados.");
     }
 
-    // KPI
-    if (NPV > 0) lines.push("Rentabilidad: VPN positivo (proyecto viable).");
-    else lines.push("Rentabilidad: VPN negativo (revisar CAPEX/tarifa/autoconsumo).");
+    if (NPV > 0) lines.push("Rentabilidad: VPN positivo (viable).");
+    else lines.push("Rentabilidad: VPN negativo (revisar supuestos).");
 
-    if (IRR != null && IRR > activeScenario.discountRate)
-      lines.push("La TIR supera la tasa de descuento: atractivo.");
+    if (IRR != null && IRR > activeScenario.discountRate) lines.push("La TIR supera la tasa de descuento: atractivo.");
     else lines.push("La TIR no supera la tasa de descuento: revisar supuestos.");
 
     if (payback != null) lines.push(`Payback estimado: año ${payback}.`);
     else lines.push("Payback: no recupera inversión dentro del horizonte.");
 
-    if (global.useVolatility) lines.push("Tarifa: variable con volatilidad activada (sensibilidad estable).");
+    if (global.useVolatility) lines.push("Tarifa: variable con volatilidad estable (sensibilidad).");
     else lines.push("Tarifa: escalamiento fijo anual.");
 
-    // Comparativo con/sin excedentes
     const deltaNPV = modelWithExports.NPV - modelNoExports.NPV;
-    lines.push(`Impacto de excedentes en VPN (Con − Sin): $ ${fmtCOP(deltaNPV)}.`);
+    lines.push(`Impacto excedentes en VPN (Con − Sin): $ ${fmtCOP(deltaNPV)}.`);
+    lines.push(`Esquema incentivos: ${schemeName}.`);
 
-    lines.push(`Esquema de incentivos seleccionado: ${schemeName}.`);
     return lines;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeModel, activeScenario, global.useVolatility, global.includeExports, modelWithExports.NPV, modelNoExports.NPV]);
+  }, [activeModel, activeScenario, global.includeExports, global.useVolatility, modelWithExports.NPV, modelNoExports.NPV]);
 
   return (
     <div className="container">
-      {/* Top bar */}
       <div className="topbar">
         <div>
           <div className="brand">
-            <div className="logo">
-              <EnergyIcon />
-            </div>
+            <div className="logo"><EnergyIcon /></div>
             <div>
               <div className="title">
                 <span className="g">Smart</span> <span className="b">Energy</span> ROI{" "}
                 <span style={{ fontSize: 12, opacity: 0.9 }}>v2.0 PRO</span>
               </div>
               <div className="subtitle">
-                Escenarios A/B/C • Incentivos Colombia • Precio energía variable • Con/Sin excedentes • PDF PRO
+                A/B/C • Incentivos Colombia • Tarifa variable • Con/Sin excedentes • PDF PRO
               </div>
             </div>
           </div>
@@ -479,37 +432,26 @@ export default function App() {
           <button className="btn" onClick={() => setEngineer((v) => !v)}>
             {engineer ? "Modo Cliente" : "Modo Ingeniero"}
           </button>
-          <button className="btn primary" onClick={exportPDF}>
-            Exportar PDF
-          </button>
-          <button className="btn" onClick={reset}>
-            Reiniciar
-          </button>
+          <button className="btn primary" onClick={exportPDF}>Exportar PDF</button>
+          <button className="btn" onClick={reset}>Reiniciar</button>
         </div>
       </div>
 
       <div className="grid">
-        {/* Left column */}
         <div style={{ display: "grid", gap: 14 }}>
-          {/* Scenarios */}
           <div className="card">
             <h3>Escenarios</h3>
             <div className="small">Trabaja con A/B/C. Cambia el activo y compara resultados.</div>
 
             <div className="segment">
               {["A", "B", "C"].map((k) => (
-                <button
-                  key={k}
-                  className={`pill ${active === k ? "active" : ""}`}
-                  onClick={() => setActive(k)}
-                >
+                <button key={k} className={`pill ${active === k ? "active" : ""}`} onClick={() => setActive(k)}>
                   {k} • {sc[k].name}
                 </button>
               ))}
             </div>
 
             <div className="hr" />
-
             <div className="small">Consejo: usa “Duplicar” para copiar supuestos del escenario activo a otro.</div>
             <div className="segment">
               <button className="btn" onClick={() => duplicateTo("A")}>Duplicar a A</button>
@@ -518,7 +460,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Inputs */}
           <div className="card">
             <h3>Entradas • Escenario {active} ({activeScenario.name})</h3>
             <div className="small">{engineer ? "Modo Ingeniero: inputs completos" : "Modo Cliente: inputs esenciales"}</div>
@@ -573,9 +514,7 @@ export default function App() {
                 <label>Incentivos tributarios (Colombia)</label>
                 <select value={activeScenario.incentiveScheme} onChange={(e) => update("incentiveScheme", e.target.value)}>
                   {INCENTIVOS.map((x) => (
-                    <option key={x.key} value={x.key}>
-                      {x.name}
-                    </option>
+                    <option key={x.key} value={x.key}>{x.name}</option>
                   ))}
                 </select>
               </div>
@@ -584,25 +523,19 @@ export default function App() {
             <div className="hr" />
 
             <div className="segment">
-              <button
-                className={`pill ${global.includeTaxBenefit ? "active" : ""}`}
-                onClick={() => setGlobal((p) => ({ ...p, includeTaxBenefit: !p.includeTaxBenefit }))}
-              >
+              <button className={`pill ${global.includeTaxBenefit ? "active" : ""}`}
+                onClick={() => setGlobal((p) => ({ ...p, includeTaxBenefit: !p.includeTaxBenefit }))}>
                 {global.includeTaxBenefit ? "✓" : " "} Incluir deducción renta (si aplica)
               </button>
 
-              <button
-                className={`pill ${global.useVolatility ? "active" : ""}`}
-                onClick={() => setGlobal((p) => ({ ...p, useVolatility: !p.useVolatility }))}
-              >
+              <button className={`pill ${global.useVolatility ? "active" : ""}`}
+                onClick={() => setGlobal((p) => ({ ...p, useVolatility: !p.useVolatility }))}>
                 {global.useVolatility ? "✓" : " "} Tarifa con volatilidad (estable)
               </button>
 
-              <button
-                className={`pill ${global.includeExports ? "active" : ""}`}
-                onClick={() => setGlobal((p) => ({ ...p, includeExports: !p.includeExports }))}
-              >
-                {global.includeExports ? "✓" : " "} Considerar excedentes (venta/compensación OR)
+              <button className={`pill ${global.includeExports ? "active" : ""}`}
+                onClick={() => setGlobal((p) => ({ ...p, includeExports: !p.includeExports }))}>
+                {global.includeExports ? "✓" : " "} Considerar excedentes
               </button>
             </div>
 
@@ -615,42 +548,34 @@ export default function App() {
                     <label>PSH (h/día)</label>
                     <input type="number" step="0.1" value={activeScenario.psh} onChange={(e) => update("psh", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>PR (0–1)</label>
                     <input type="number" step="0.01" value={activeScenario.pr} onChange={(e) => update("pr", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>Degradación anual</label>
                     <input type="number" step="0.001" value={activeScenario.degAnnual} onChange={(e) => update("degAnnual", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>Precio excedentes (factor vs tarifa)</label>
                     <input type="number" step="0.01" value={activeScenario.exportFactor} onChange={(e) => update("exportFactor", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>IVA (simulación)</label>
                     <input type="number" step="0.01" value={activeScenario.ivaRate} onChange={(e) => update("ivaRate", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>Arancel (simulación)</label>
                     <input type="number" step="0.01" value={activeScenario.arancelRate} onChange={(e) => update("arancelRate", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>Tarifa de renta (simulación)</label>
                     <input type="number" step="0.01" value={activeScenario.taxRate} onChange={(e) => update("taxRate", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>Años deducción (simulación)</label>
                     <input type="number" value={activeScenario.deductionYears} onChange={(e) => update("deductionYears", Number(e.target.value))} />
                   </div>
-
                   <div className="field">
                     <label>Volatilidad tarifa (±)</label>
                     <input type="number" step="0.01" value={activeScenario.tariffVolatility} onChange={(e) => update("tariffVolatility", Number(e.target.value))} />
@@ -661,9 +586,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right column */}
         <div style={{ display: "grid", gap: 14 }}>
-          {/* Chart */}
           <div className="card">
             <h3>Gráfica comparativa</h3>
             <div className="small">Flujo acumulado por escenario (A/B/C).</div>
@@ -693,15 +616,14 @@ export default function App() {
             </div>
 
             <div className="note">
-              Nota PRO: volatilidad es estable (no cambia sola). Excedentes en Colombia tienen reglas/compensaciones según OR y regulación aplicable. :contentReference[oaicite:3]{index=3}
+              Nota PRO: volatilidad estable (no cambia sola). Excedentes dependen de reglas del OR.
             </div>
           </div>
 
-          {/* ✅ PRO: Con vs Sin excedentes */}
           <div className="card">
             <h3>Viabilidad: Con vs Sin excedentes</h3>
             <div className="small">
-              Comparación del escenario <b>{active}</b> ({activeScenario.name}) con excedentes (ON) y sin excedentes (OFF).
+              Comparación del escenario <b>{active}</b> ({activeScenario.name}) con excedentes y sin excedentes.
             </div>
 
             <div className="hr" />
@@ -711,41 +633,26 @@ export default function App() {
                 <div className="label">VPN (Con excedentes)</div>
                 <div className="value green">$ {fmtCOP(modelWithExports.NPV)}</div>
               </div>
-
               <div className="kpi">
                 <div className="label">VPN (Sin excedentes)</div>
                 <div className="value green">$ {fmtCOP(modelNoExports.NPV)}</div>
               </div>
-
               <div className="kpi">
                 <div className="label">TIR (Con excedentes)</div>
                 <div className="value blue">{modelWithExports.IRR == null ? "—" : fmtPct(modelWithExports.IRR)}</div>
               </div>
-
               <div className="kpi">
                 <div className="label">TIR (Sin excedentes)</div>
                 <div className="value blue">{modelNoExports.IRR == null ? "—" : fmtPct(modelNoExports.IRR)}</div>
               </div>
-
-              <div className="kpi">
-                <div className="label">Payback (Con excedentes)</div>
-                <div className="value">{modelWithExports.payback == null ? "—" : `${modelWithExports.payback} años`}</div>
-              </div>
-
-              <div className="kpi">
-                <div className="label">Payback (Sin excedentes)</div>
-                <div className="value">{modelNoExports.payback == null ? "—" : `${modelNoExports.payback} años`}</div>
-              </div>
             </div>
 
             <div className="note">
-              Impacto de excedentes en VPN (Con − Sin): <b>$ {fmtCOP(modelWithExports.NPV - modelNoExports.NPV)}</b>.
-              <br />
-              Señal PRO (año 1): excedentes aportan ~<b>{fmtPct(modelWithExports.exportShareY1)}</b> de ingresos.
+              Impacto excedentes en VPN (Con − Sin): <b>$ {fmtCOP(modelWithExports.NPV - modelNoExports.NPV)}</b><br/>
+              Señal PRO (año 1): excedentes ~<b>{fmtPct(modelWithExports.exportShareY1)}</b> de ingresos.
             </div>
           </div>
 
-          {/* Results + conclusions */}
           <div className="card">
             <h3>Conclusiones • Escenario {active} ({activeScenario.name})</h3>
 
@@ -754,17 +661,14 @@ export default function App() {
                 <div className="label">VPN (NPV)</div>
                 <div className="value green">$ {fmtCOP(activeModel.NPV)}</div>
               </div>
-
               <div className="kpi">
                 <div className="label">TIR (IRR)</div>
                 <div className="value blue">{activeModel.IRR == null ? "—" : fmtPct(activeModel.IRR)}</div>
               </div>
-
               <div className="kpi">
                 <div className="label">Payback</div>
                 <div className="value">{activeModel.payback == null ? "—" : `${activeModel.payback} años`}</div>
               </div>
-
               <div className="kpi">
                 <div className="label">ROI año 1</div>
                 <div className="value">{fmtPct(activeModel.roi1)}</div>
@@ -773,9 +677,7 @@ export default function App() {
 
             <div className="hr" />
             <ul className="list">
-              {conclusions.map((c, i) => (
-                <li key={i}>{c}</li>
-              ))}
+              {conclusions.map((c, i) => <li key={i}>{c}</li>)}
             </ul>
 
             <div className="note">
@@ -785,7 +687,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Hidden report for PDF */}
+      {/* PDF report (oculto) */}
       <div className="reportWrap">
         <div className="report" ref={reportRef}>
           <h1>Smart Energy ROI v2.0 PRO • Reporte</h1>
@@ -802,35 +704,26 @@ export default function App() {
               <div className="t">TIR</div>
               <div className="v">{activeModel.IRR == null ? "—" : fmtPct(activeModel.IRR)}</div>
             </div>
-            <div className="box">
-              <div className="t">Payback</div>
-              <div className="v">{activeModel.payback == null ? "—" : `${activeModel.payback} años`}</div>
-            </div>
-            <div className="box">
-              <div className="t">ROI año 1</div>
-              <div className="v">{fmtPct(activeModel.roi1)}</div>
-            </div>
           </div>
 
           <div className="row">
             <div className="box">
-              <div className="t">Con vs Sin excedentes (escenario {active})</div>
+              <div className="t">Con vs Sin excedentes</div>
               <div className="muted" style={{ marginTop: 8 }}>
                 VPN con excedentes: <b>$ {fmtCOP(modelWithExports.NPV)}</b><br/>
                 VPN sin excedentes: <b>$ {fmtCOP(modelNoExports.NPV)}</b><br/>
-                Diferencia (Con − Sin): <b>$ {fmtCOP(modelWithExports.NPV - modelNoExports.NPV)}</b><br/>
-                % ingresos por excedentes (año 1): <b>{fmtPct(modelWithExports.exportShareY1)}</b>
+                Diferencia: <b>$ {fmtCOP(modelWithExports.NPV - modelNoExports.NPV)}</b><br/>
+                % ingresos excedentes (año 1): <b>{fmtPct(modelWithExports.exportShareY1)}</b>
               </div>
             </div>
-
             <div className="box">
               <div className="t">Entradas principales</div>
               <div className="muted" style={{ marginTop: 8 }}>
                 Potencia: <b>{activeScenario.kW} kW</b><br/>
                 Tarifa: <b>{fmtCOP(activeScenario.tariff)} COP/kWh</b><br/>
                 Autoconsumo: <b>{fmtPct(activeScenario.selfConsumption)}</b><br/>
-                CAPEX (bruto): <b>$ {fmtCOP(activeScenario.capex)}</b><br/>
-                CAPEX (neto): <b>$ {fmtCOP(activeModel.capexNeto)}</b>
+                CAPEX bruto: <b>$ {fmtCOP(activeScenario.capex)}</b><br/>
+                CAPEX neto: <b>$ {fmtCOP(activeModel.capexNeto)}</b>
               </div>
             </div>
           </div>
@@ -839,23 +732,16 @@ export default function App() {
             <div className="box">
               <div className="t">Conclusiones</div>
               <ul>
-                {conclusions.map((c, i) => (
-                  <li key={i}>{c}</li>
-                ))}
+                {conclusions.map((c, i) => <li key={i}>{c}</li>)}
               </ul>
             </div>
             <div className="box">
               <div className="t">Nota</div>
               <div className="muted" style={{ marginTop: 8 }}>
-                Este reporte usa “layout blanco” para asegurar legibilidad en PDF.
-                <br />
-                Excedentes y conexión AGPE/GD están sujetos a regulación y reglas del OR. :contentReference[oaicite:4]{index=4}
+                Reporte en fondo blanco para máxima legibilidad.
+                Incentivos y excedentes son simulación educativa y dependen de requisitos reales.
               </div>
             </div>
-          </div>
-
-          <div className="muted" style={{ marginTop: 10 }}>
-            Incentivos tributarios (simulación) basados en marcos divulgativos de Ley 1715/UPME. :contentReference[oaicite:5]{index=5}
           </div>
         </div>
       </div>
